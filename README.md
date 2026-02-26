@@ -20,6 +20,7 @@ Hundreds of instances have been found exposed on the internet without authentica
 6. Grants temporary sudo, installs OpenClaw globally
 7. Enables systemd lingering so the service survives logout
 8. **Revokes sudo** — the `openclaw` user ends up with no privileged access
+9. **Locks down the network** — the VM can only reach the default gateway (for internet) and nothing else on the LAN
 
 ## Requirements
 
@@ -31,7 +32,7 @@ Hundreds of instances have been found exposed on the internet without authentica
 ## Usage
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/openclaw-vm-setup.git
+git clone https://github.com/MundoFacu/openclaw-vm-setup.git
 cd openclaw-vm-setup
 chmod +x setup_openclaw.sh
 sudo ./setup_openclaw.sh
@@ -76,6 +77,43 @@ openclaw pairing approve telegram <CODE>
 ```
 
 **Take a VM snapshot.** Do it now, before the agent touches anything.
+
+## Network hardening
+
+The script auto-detects your default gateway and local subnet, then sets up iptables rules so the VM can only reach the gateway (for internet via NAT) and nothing else on the LAN. No port scanning, no lateral movement.
+
+What's allowed:
+- Loopback (OpenClaw gateway binds to 127.0.0.1)
+- Established/related connections (so your SSH session doesn't drop)
+- Traffic to the default gateway (internet access)
+
+What's blocked:
+- Everything else on the local subnet
+
+Rules are persisted across reboots via `iptables-persistent`. To verify:
+
+```bash
+# should work (internet via gateway):
+curl -s https://api.telegram.org --max-time 5
+
+# should fail (LAN blocked):
+ping -c1 -W2 192.168.1.100
+```
+
+To inspect or modify the rules:
+
+```bash
+sudo iptables -L OUTPUT -v -n          # see current rules
+sudo iptables -D OUTPUT -d <subnet> -j DROP  # remove a rule (careful)
+sudo netfilter-persistent save         # persist changes
+```
+
+If you need the VM to reach a specific LAN host (e.g., a local LLM server), add an allow rule _before_ the subnet drop:
+
+```bash
+sudo iptables -I OUTPUT 4 -d 192.168.1.50 -j ACCEPT
+sudo netfilter-persistent save
+```
 
 ## Useful commands
 
