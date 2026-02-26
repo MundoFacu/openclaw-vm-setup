@@ -22,6 +22,7 @@
 #   - Runs OpenClaw under its own user, not yours
 #   - Gives it sudo only during setup, then takes it away
 #   - Sets up swap so npm doesn't OOM during install
+#   - Locks the VM to gateway-only LAN access (no scanning, no pivoting)
 #
 # But the real protection is the VM itself. If something goes wrong,
 # you delete the VM and restore a snapshot. So:
@@ -178,6 +179,73 @@ rm -f "/etc/sudoers.d/${OPENCLAW_USER}"
 gpasswd -d "$OPENCLAW_USER" sudo 2>/dev/null || true
 log "Sudo revoked for '${OPENCLAW_USER}'"
 
+# -- hardening: network lockdown --
+#
+# This is the part most guides skip. The VM can reach your entire LAN
+# by default — every NAS, every server, every printer. If the agent
+# gets popped, the attacker can scan your network and pivot.
+#
+# We fix that here: the VM can only talk to the default gateway
+# (for internet access via NAT) and nothing else on the local network.
+# No port scanning, no lateral movement, no "oops it found my NAS".
+
+echo ""
+echo -e "${CYAN}Locking down network...${NC}"
+
+GATEWAY=$(ip route | awk '/default/ {print $3; exit}')
+# grab the local subnet from the route that isn't the default
+LOCAL_SUBNET=$(ip -4 route show | awk '!/default/ && /src/ {print $1; exit}')
+VM_IFACE=$(ip route | awk '/default/ {print $5; exit}')
+
+if [[ -z "$GATEWAY" || -z "$LOCAL_SUBNET" || -z "$VM_IFACE" ]]; then
+    warn "Couldn't detect network config. Skipping firewall rules."
+    warn "You should set these up manually — see the README."
+else
+    echo "  Gateway:  $GATEWAY"
+    echo "  Subnet:   $LOCAL_SUBNET"
+    echo "  Iface:    $VM_IFACE"
+    echo ""
+
+    # install iptables-persistent non-interactively
+    DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
+
+    # flush any existing rules so we start clean
+    iptables -F OUTPUT
+
+    # loopback is fine — openclaw gateway binds to 127.0.0.1
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # let existing connections keep working (important: SSH won't drop)
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # allow talking to the gateway — that's our only way out to the internet
+    iptables -A OUTPUT -d "$GATEWAY" -j ACCEPT
+
+    # block everything else on the local subnet
+    # this is the important one: no scanning, no lateral movement
+    iptables -A OUTPUT -d "$LOCAL_SUBNET" -j DROP
+
+    # everything else (internet) is fine — the agent needs to reach
+    # API endpoints, telegram, npm, etc.
+    iptables -A OUTPUT -j ACCEPT
+
+    # same thing for ipv6 — just block all LAN traffic to be safe
+    # most home/lab networks don't need ipv6 between VMs
+    ip6tables -F OUTPUT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A OUTPUT -d fe80::/10 -j DROP
+    ip6tables -A OUTPUT -d fc00::/7 -j DROP
+    ip6tables -A OUTPUT -j ACCEPT
+
+    # make it survive reboots
+    netfilter-persistent save
+
+    log "Firewall rules applied and saved"
+    log "VM can reach: gateway ($GATEWAY) + internet"
+    log "VM CANNOT reach: anything else on $LOCAL_SUBNET"
+fi
+
 # -- done --
 
 echo ""
@@ -210,7 +278,15 @@ echo ""
 echo "       openclaw pairing list telegram"
 echo "       openclaw pairing approve telegram <CODE>"
 echo ""
-echo "  5. Take a VM snapshot. Seriously, do it now."
+echo "  5. Verify the firewall rules are working:"
+echo ""
+echo "       # from inside the VM, this should work:"
+echo "       curl -s https://api.telegram.org --max-time 5 && echo 'Internet OK'"
+echo ""
+echo "       # and this should NOT work (pick any LAN IP that isn't the gateway):"
+echo "       ping -c1 -W2 192.168.1.100 && echo 'BAD: LAN reachable' || echo 'Good: blocked'"
+echo ""
+echo "  6. Take a VM snapshot. Seriously, do it now."
 echo ""
 echo -e "${YELLOW}Remember: '${OPENCLAW_USER}' has no sudo anymore.${NC}"
 echo "Use your admin user for anything that needs root."
